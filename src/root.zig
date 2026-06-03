@@ -34,7 +34,15 @@ const Card = struct {
 
 const Move = struct {};
 
-const PlayerData = struct { a: u8 };
+const PlayerData = struct {
+    state: union(enum) {
+        init,
+        deal: []Card,
+        draft: struct { hand: [4]Card, crib: [2]Card },
+        play: []Card,
+    },
+    score: u8 = 0,
+};
 
 const Player = struct {
     data: PlayerData,
@@ -42,8 +50,8 @@ const Player = struct {
     vtable: *const VTable,
 
     const VTable = struct {
-        getMove: *const fn (*anyopaque) Move,
-        getLegalMoves: *const @TypeOf(getLegalMoves) = getLegalMoves,
+        getMove: *const fn (*anyopaque) anyerror!Move,
+        draft: *const fn (*anyopaque) anyerror!void,
     };
 
     fn init(ptr: anytype) Player {
@@ -56,9 +64,14 @@ const Player = struct {
                 return self.data;
             }
 
-            pub fn getMove(pointer: *anyopaque) Move {
+            pub fn getMove(pointer: *anyopaque) anyerror!Move {
                 const self: T = @ptrCast(@alignCast(pointer));
                 return ptr_info.pointer.child.getMove(self);
+            }
+
+            pub fn draft(pointer: *anyopaque) anyerror!void {
+                const self: T = @ptrCast(@alignCast(pointer));
+                return ptr_info.pointer.child.draft(self);
             }
         };
 
@@ -67,13 +80,17 @@ const Player = struct {
             .ptr = ptr,
             .vtable = &.{
                 .getMove = gen.getMove,
-                .getLegalMoves = getLegalMoves,
+                .draft = gen.draft,
             },
         };
     }
 
-    pub fn getMove(self: Player) Move {
+    pub fn getMove(self: Player) !Move {
         return self.vtable.getMove(self.ptr);
+    }
+
+    pub fn draft(self: Player) !void {
+        self.vtable.draft(self.ptr) catch |e| return e;
     }
 
     pub fn getLegalMoves(self: Player) []const Move {
@@ -85,9 +102,13 @@ const Player = struct {
 const RandomPlayer = struct {
     data: PlayerData,
 
-    fn getMove(self: *RandomPlayer) Move {
+    fn getMove(self: *RandomPlayer) !Move {
         _ = self;
         return .{};
+    }
+
+    fn draft(self: *RandomPlayer) !void {
+        _ = self;
     }
 
     fn player(self: *RandomPlayer) Player {
@@ -101,15 +122,19 @@ const HumanPlayer = struct {
 
     pub fn init(reader: *std.Io.Reader) HumanPlayer {
         return .{
-            .data = .{ .a = 0 },
+            .data = .{ .state = .init },
             .reader = reader,
         };
     }
 
-    fn getMove(self: *HumanPlayer) Move {
-        const line = self.reader.takeDelimiter('\n') catch return .{};
+    fn getMove(self: *HumanPlayer) !Move {
+        const line = try self.reader.takeDelimiter('\n');
         std.debug.print("{s}\n", .{line.?});
         return .{};
+    }
+
+    fn draft(self: *HumanPlayer) !void {
+        _ = self;
     }
 
     fn player(self: *HumanPlayer) Player {
@@ -140,37 +165,94 @@ const Deck = struct {
     }
 };
 
-const Board = struct {};
-
 const GameState = union(enum) {
-    init,
+    cut,
+    deal,
+    play: struct {
+        active_player: usize,
+        cut: Card = undefined,
+        revealed: []Card = &[_]Card{},
+        pile: []Card = &[_]Card{},
+    },
+    show: struct { active_player: usize },
 };
 
 const Game = struct {
+    stdout: *std.Io.Writer,
     p_buf: [max_players]Player,
     players: std.ArrayList(Player),
-    deck: Deck,
-    board: Board,
     state: GameState,
+    deck: Deck,
+    dealer: usize,
 
     const min_players = 2;
-    const max_players = 6;
+    const max_players = 4;
 
-    pub fn pinnedInit(self: *Game, rng: std.Random, stdin: *std.Io.Reader, num_players: usize) void {
+    pub fn pinnedInit(self: *Game, stdin: *std.Io.Reader, stdout: *std.Io.Writer, num_players: usize) void {
+        self.stdout = stdout;
         self.players = .initBuffer(&self.p_buf);
 
         var human = HumanPlayer.init(stdin);
-        var p = human.player();
-        self.players.appendAssumeCapacity(p);
+        self.players.appendAssumeCapacity(human.player());
         for (0..num_players - 1) |_| {
-            var ai = RandomPlayer{ .data = .{ .a = 2 } };
-            p = ai.player();
-            self.players.appendAssumeCapacity(p);
+            var ai = RandomPlayer{ .data = .{ .state = .init } };
+            self.players.appendAssumeCapacity(ai.player());
         }
 
+        self.state = .cut;
+    }
+
+    fn cut(self: *Game, rng: std.Random) !void {
+        const dealer = rng.uintLessThan(usize, self.players.items.len);
+        try self.stdout.print("player {} cut lowest and is dealer\n", .{dealer});
+        try self.stdout.flush();
+
+        self.dealer = dealer;
+        self.state = .deal;
+    }
+
+    fn deal(self: *Game, rng: std.Random) !void {
         self.deck.pinnedInit(rng);
-        self.board = Board{};
-        self.state = .init;
+
+        self.state = .{ .play = .{ .active_player = (self.dealer + 1) % self.players.items.len } };
+
+        const num_cards: u8 = switch (self.players.items.len) {
+            2 => 6,
+            3, 4 => 5,
+            else => unreachable,
+        };
+
+        const dealer_gets_extra = self.players.items.len == 3;
+
+        for (self.players.items, 0..) |*player, i| {
+            const n = if (dealer_gets_extra and i == self.dealer) num_cards + 1 else num_cards;
+            player.data.state = .{ .deal = self.deck.deal(n) };
+            try player.draft();
+        }
+
+        self.state.play.cut = self.deck.deal(1)[0];
+    }
+
+    fn play(self: *Game) void {
+        const active_player = self.state.play.active_player;
+
+        if (active_player == self.dealer) {
+            self.state = .{ .show = (self.dealer + 1) % self.players.items.len };
+        } else {
+            self.state.play.active_player = (active_player + 1) % self.players.items.len;
+        }
+    }
+
+    fn show(self: *Game) void {
+        _ = self;
+    }
+
+    fn round(self: *Game) void {
+        _ = self;
+    }
+
+    fn turn(self: *Game) void {
+        _ = self;
     }
 };
 
@@ -181,8 +263,15 @@ pub fn main(init: std.process.Init) !void {
     var stdin_reader = std.Io.File.stdin().reader(init.io, &stdin_buf);
     const stdin = &stdin_reader.interface;
 
-    var game: Game = undefined;
-    game.pinnedInit(rng, stdin, 2);
+    var stdout_buf: [64]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buf);
+    const stdout = &stdout_writer.interface;
 
-    _ = game.players.items[0].getMove();
+    var game: Game = undefined;
+    game.pinnedInit(stdin, stdout, 2);
+
+    _ = try game.players.items[0].getMove();
+    try game.cut(rng);
+    try game.deal(rng);
+    std.debug.print("{any}\n", .{game.players.items[0].data.state.deal});
 }
