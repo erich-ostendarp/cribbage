@@ -34,24 +34,26 @@ const Card = struct {
 
 const Move = struct {};
 
-const PlayerData = struct {
-    state: union(enum) {
-        init,
-        deal: []Card,
-        draft: struct { hand: [4]Card, crib: [2]Card },
-        play: []Card,
-    },
-    score: u8 = 0,
-};
-
 const Player = struct {
-    data: PlayerData,
+    data: *Data,
     ptr: *anyopaque,
     vtable: *const VTable,
 
     const VTable = struct {
         getMove: *const fn (*anyopaque) anyerror!Move,
-        draft: *const fn (*anyopaque) anyerror!void,
+        draft: *const fn (*anyopaque) anyerror![]Card,
+    };
+
+    const Data = struct {
+        state: union(enum) {
+            init,
+            deal: struct { is_dealer: bool = false, cards: []Card },
+            draft: struct { hand: [4]Card },
+            play: struct { hand: []Card, cut_card: Card, pile: []Card },
+            show: struct { hand: []Card, cut_card: Card },
+        },
+        score: u8 = 0,
+        crib: ?[4]Card = null,
     };
 
     fn init(ptr: anytype) Player {
@@ -59,9 +61,9 @@ const Player = struct {
         const ptr_info = @typeInfo(T);
 
         const gen = struct {
-            pub fn data(pointer: *anyopaque) PlayerData {
+            pub fn data(pointer: *anyopaque) *Data {
                 const self: T = @ptrCast(@alignCast(pointer));
-                return self.data;
+                return &self.data;
             }
 
             pub fn getMove(pointer: *anyopaque) anyerror!Move {
@@ -69,7 +71,7 @@ const Player = struct {
                 return ptr_info.pointer.child.getMove(self);
             }
 
-            pub fn draft(pointer: *anyopaque) anyerror!void {
+            pub fn draft(pointer: *anyopaque) anyerror![]Card {
                 const self: T = @ptrCast(@alignCast(pointer));
                 return ptr_info.pointer.child.draft(self);
             }
@@ -89,8 +91,8 @@ const Player = struct {
         return self.vtable.getMove(self.ptr);
     }
 
-    pub fn draft(self: Player) !void {
-        self.vtable.draft(self.ptr) catch |e| return e;
+    pub fn draft(self: Player) ![]Card {
+        return self.vtable.draft(self.ptr);
     }
 
     pub fn getLegalMoves(self: Player) []const Move {
@@ -100,15 +102,33 @@ const Player = struct {
 };
 
 const RandomPlayer = struct {
-    data: PlayerData,
+    data: Player.Data,
+    rng: std.Random,
+
+    pub fn init(rng: std.Random) RandomPlayer {
+        return .{
+            .data = .{ .state = .init },
+            .rng = rng,
+        };
+    }
 
     fn getMove(self: *RandomPlayer) !Move {
         _ = self;
         return .{};
     }
 
-    fn draft(self: *RandomPlayer) !void {
-        _ = self;
+    fn draft(self: *RandomPlayer) ![]Card {
+        const deal = self.data.state.deal;
+
+        var cards = deal.cards;
+        self.rng.shuffle(Card, cards);
+
+        const hand = cards[0..4];
+        const crib = cards[4..];
+
+        self.data.state = .{ .draft = .{ .hand = hand.* } };
+
+        return crib;
     }
 
     fn player(self: *RandomPlayer) Player {
@@ -117,7 +137,7 @@ const RandomPlayer = struct {
 };
 
 const HumanPlayer = struct {
-    data: PlayerData,
+    data: Player.Data,
     reader: *std.Io.Reader,
 
     pub fn init(reader: *std.Io.Reader) HumanPlayer {
@@ -133,8 +153,18 @@ const HumanPlayer = struct {
         return .{};
     }
 
-    fn draft(self: *HumanPlayer) !void {
-        _ = self;
+    // FIX: take user input
+    fn draft(self: *HumanPlayer) ![]Card {
+        const deal = self.data.state.deal;
+
+        var cards = deal.cards;
+
+        const hand = cards[0..4];
+        const crib = cards[4..];
+
+        self.data.state = .{ .draft = .{ .hand = hand.* } };
+
+        return crib;
     }
 
     fn player(self: *HumanPlayer) Player {
@@ -165,39 +195,34 @@ const Deck = struct {
     }
 };
 
-const GameState = union(enum) {
-    cut,
-    deal,
-    play: struct {
-        active_player: usize,
-        cut: Card = undefined,
-        revealed: []Card = &[_]Card{},
-        pile: []Card = &[_]Card{},
-    },
-    show: struct { active_player: usize },
-};
-
 const Game = struct {
     stdout: *std.Io.Writer,
     p_buf: [max_players]Player,
     players: std.ArrayList(Player),
-    state: GameState,
+    state: State,
     deck: Deck,
     dealer: usize,
 
     const min_players = 2;
     const max_players = 4;
 
-    pub fn pinnedInit(self: *Game, stdin: *std.Io.Reader, stdout: *std.Io.Writer, num_players: usize) void {
+    const State = union(enum) {
+        cut,
+        deal,
+        play: struct {
+            active_player: usize,
+            cut: Card = undefined,
+            revealed: []Card = &[_]Card{},
+            pile: []Card = &[_]Card{},
+        },
+        show: struct { active_player: usize },
+    };
+
+    pub fn pinnedInit(self: *Game, stdout: *std.Io.Writer, players: []Player) void {
         self.stdout = stdout;
         self.players = .initBuffer(&self.p_buf);
 
-        var human = HumanPlayer.init(stdin);
-        self.players.appendAssumeCapacity(human.player());
-        for (0..num_players - 1) |_| {
-            var ai = RandomPlayer{ .data = .{ .state = .init } };
-            self.players.appendAssumeCapacity(ai.player());
-        }
+        self.players.appendSliceAssumeCapacity(players);
 
         self.state = .cut;
     }
@@ -222,19 +247,36 @@ const Game = struct {
             else => unreachable,
         };
 
-        const dealer_gets_extra = self.players.items.len == 3;
+        var crib_buf: [4]Card = undefined;
+        var crib = std.ArrayList(Card).initBuffer(&crib_buf);
 
         for (self.players.items, 0..) |*player, i| {
-            const n = if (dealer_gets_extra and i == self.dealer) num_cards + 1 else num_cards;
-            player.data.state = .{ .deal = self.deck.deal(n) };
-            try player.draft();
+            player.data.state = .{ .deal = .{
+                .is_dealer = i == self.dealer,
+                .cards = self.deck.deal(num_cards),
+            } };
+
+            crib.appendSliceAssumeCapacity(try player.draft());
         }
 
-        self.state.play.cut = self.deck.deal(1)[0];
+        if (crib.items.len == 3) {
+            crib.appendAssumeCapacity(self.deck.deal(1)[0]);
+        }
+
+        self.players.items[self.dealer].data.crib = crib.items[0..4].*;
+
+        const cut_card = self.deck.deal(1)[0];
+
+        self.state.play.cut = cut_card;
+        if (cut_card.rank == .jack) {
+            self.players.items[(self.dealer + 1) % self.players.items.len].data.score += 2;
+        }
     }
 
     fn play(self: *Game) void {
         const active_player = self.state.play.active_player;
+
+        self.players.items[active_player].play();
 
         if (active_player == self.dealer) {
             self.state = .{ .show = (self.dealer + 1) % self.players.items.len };
@@ -267,11 +309,20 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
-    var game: Game = undefined;
-    game.pinnedInit(stdin, stdout, 2);
+    var human = HumanPlayer.init(stdin);
+    var ais: [2]RandomPlayer = undefined;
+    for (&ais) |*ai| {
+        ai.* = .init(rng);
+    }
 
-    _ = try game.players.items[0].getMove();
+    var players: [3]Player = undefined;
+    players[0] = human.player();
+    players[1] = ais[0].player();
+    players[2] = ais[1].player();
+
+    var game: Game = undefined;
+    game.pinnedInit(stdout, &players);
+
     try game.cut(rng);
     try game.deal(rng);
-    std.debug.print("{any}\n", .{game.players.items[0].data.state.deal});
 }
