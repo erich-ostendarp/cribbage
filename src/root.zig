@@ -40,8 +40,8 @@ const Player = struct {
     vtable: *const VTable,
 
     const VTable = struct {
-        getMove: *const fn (*anyopaque) anyerror!Move,
         draft: *const fn (*anyopaque) anyerror![]Card,
+        play: *const fn (*anyopaque) anyerror!Card,
     };
 
     const Data = struct {
@@ -66,14 +66,14 @@ const Player = struct {
                 return &self.data;
             }
 
-            pub fn getMove(pointer: *anyopaque) anyerror!Move {
-                const self: T = @ptrCast(@alignCast(pointer));
-                return ptr_info.pointer.child.getMove(self);
-            }
-
-            pub fn draft(pointer: *anyopaque) anyerror![]Card {
+            pub fn draft(pointer: *anyopaque) ![]Card {
                 const self: T = @ptrCast(@alignCast(pointer));
                 return ptr_info.pointer.child.draft(self);
+            }
+
+            pub fn play(pointer: *anyopaque) !Card {
+                const self: T = @ptrCast(@alignCast(pointer));
+                return ptr_info.pointer.child.play(self);
             }
         };
 
@@ -81,23 +81,18 @@ const Player = struct {
             .data = gen.data(ptr),
             .ptr = ptr,
             .vtable = &.{
-                .getMove = gen.getMove,
                 .draft = gen.draft,
+                .play = gen.play,
             },
         };
-    }
-
-    pub fn getMove(self: Player) !Move {
-        return self.vtable.getMove(self.ptr);
     }
 
     pub fn draft(self: Player) ![]Card {
         return self.vtable.draft(self.ptr);
     }
 
-    pub fn getLegalMoves(self: Player) []const Move {
-        _ = self;
-        return &.{ .{}, .{}, .{} };
+    pub fn play(self: Player) !Card {
+        return self.vtable.play(self.ptr);
     }
 };
 
@@ -112,11 +107,6 @@ const RandomPlayer = struct {
         };
     }
 
-    fn getMove(self: *RandomPlayer) !Move {
-        _ = self;
-        return .{};
-    }
-
     fn draft(self: *RandomPlayer) ![]Card {
         const deal = self.data.state.deal;
 
@@ -129,6 +119,15 @@ const RandomPlayer = struct {
         self.data.state = .{ .draft = .{ .hand = hand.* } };
 
         return crib;
+    }
+
+    fn play(self: *RandomPlayer) !Card {
+        var hand = self.data.state.play.hand;
+        self.rng.shuffle(Card, hand);
+
+        self.data.state.play.hand = hand[1..];
+
+        return hand[0];
     }
 
     fn player(self: *RandomPlayer) Player {
@@ -147,12 +146,6 @@ const HumanPlayer = struct {
         };
     }
 
-    fn getMove(self: *HumanPlayer) !Move {
-        const line = try self.reader.takeDelimiter('\n');
-        std.debug.print("{s}\n", .{line.?});
-        return .{};
-    }
-
     // FIX: take user input
     fn draft(self: *HumanPlayer) ![]Card {
         const deal = self.data.state.deal;
@@ -165,6 +158,14 @@ const HumanPlayer = struct {
         self.data.state = .{ .draft = .{ .hand = hand.* } };
 
         return crib;
+    }
+
+    // FIX: implement
+    fn play(self: *HumanPlayer) !Card {
+        var hand = self.data.state.play.hand;
+        self.data.state.play.hand = hand[1..];
+
+        return hand[0];
     }
 
     fn player(self: *HumanPlayer) Player {
@@ -211,7 +212,7 @@ const Game = struct {
         deal,
         play: struct {
             active_player: usize,
-            cut: Card = undefined,
+            cut: Card,
             revealed: []Card = &[_]Card{},
             pile: []Card = &[_]Card{},
         },
@@ -239,8 +240,6 @@ const Game = struct {
     fn deal(self: *Game, rng: std.Random) !void {
         self.deck.pinnedInit(rng);
 
-        self.state = .{ .play = .{ .active_player = (self.dealer + 1) % self.players.items.len } };
-
         const num_cards: u8 = switch (self.players.items.len) {
             2 => 6,
             3, 4 => 5,
@@ -266,20 +265,30 @@ const Game = struct {
         self.players.items[self.dealer].data.crib = crib.items[0..4].*;
 
         const cut_card = self.deck.deal(1)[0];
+        self.state = .{ .play = .{ .active_player = (self.dealer + 1) % self.players.items.len, .cut = cut_card } };
 
-        self.state.play.cut = cut_card;
         if (cut_card.rank == .jack) {
             self.players.items[(self.dealer + 1) % self.players.items.len].data.score += 2;
         }
+
+        for (self.players.items) |*player| {
+            var hand = player.data.state.draft.hand;
+            player.data.state = .{ .play = .{
+                .hand = &hand,
+                .cut_card = cut_card,
+                .pile = &[_]Card{},
+            } };
+        }
     }
 
-    fn play(self: *Game) void {
+    fn play(self: *Game) !void {
         const active_player = self.state.play.active_player;
 
-        self.players.items[active_player].play();
+        const card = try self.players.items[active_player].play();
+        std.debug.print("{}\n", .{card});
 
         if (active_player == self.dealer) {
-            self.state = .{ .show = (self.dealer + 1) % self.players.items.len };
+            self.state = .{ .show = .{ .active_player = (self.dealer + 1) % self.players.items.len } };
         } else {
             self.state.play.active_player = (active_player + 1) % self.players.items.len;
         }
@@ -325,4 +334,5 @@ pub fn main(init: std.process.Init) !void {
 
     try game.cut(rng);
     try game.deal(rng);
+    try game.play();
 }
