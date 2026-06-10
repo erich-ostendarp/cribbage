@@ -5,17 +5,28 @@ const Card = @This();
 rank: Rank,
 suit: Suit,
 
-pub const Rank = enum {
-    ace,
-    @"2",
-    @"3",
-    @"4",
-    @"5",
-    @"6",
-    @"7",
-    @"8",
-    @"9",
-    @"10",
+pub fn val(self: Card) u4 {
+    return switch (self.rank) {
+        .jack, .queen, .king => 10,
+        else => |v| v,
+    };
+}
+
+pub fn index(self: Card) usize {
+    return @intFromEnum(self.suit) * Rank.len + @intFromEnum(self.rank);
+}
+
+pub const Rank = enum(u4) {
+    ace = 1,
+    two,
+    three,
+    four,
+    five,
+    six,
+    seven,
+    eight,
+    nine,
+    ten,
     jack,
     queen,
     king,

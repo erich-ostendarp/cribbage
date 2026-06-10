@@ -32,9 +32,9 @@ pub fn pinnedInit(self: *Game, stdout: *std.Io.Writer, players: []Player) !void 
 
 pub fn run(self: *Game, rng: std.Random) !void {
     self.state = switch (self.state) {
-        .cut => |*c| .{ .deal = c.cut(rng) },
-        .deal => |*d| .{ .play = try d.deal(rng) },
-        .play => |*p| .{ .show = p.play().? },
+        .cut => |*s| .{ .deal = s.cut(rng) },
+        .deal => |*s| .{ .play = try s.deal(rng) },
+        .play => |*s| .{ .show = s.play().? },
         .show => |*s| .{ .deal = s.show().? },
     };
 }

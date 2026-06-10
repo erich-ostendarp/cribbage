@@ -55,11 +55,32 @@ pub fn init(ptr: anytype) Player {
 }
 
 pub fn draft(self: Player, draft_view: DraftView) !Draft {
-    return self.vtable.draft(self.ptr, draft_view);
+    const ret = try self.vtable.draft(self.ptr, draft_view);
+    if (!isDraftLegal(draft_view.cards, ret.hand, ret.crib)) return error.IllegalDraft;
+    return ret;
+}
+
+fn isDraftLegal(cards: []const Card, hand: []const Card, crib: []const Card) bool {
+    if (hand.len != 4) return false;
+    if (crib.len != cards.len - 4) return false;
+
+    var seen = std.StaticBitSet(Card.Suit.len * Card.Rank.len).empty;
+    for (hand) |c| seen.set(c.index());
+    for (crib) |c| seen.set(c.index());
+    for (cards) |c| if (!seen.isSet(c.index())) return false;
+
+    return true;
 }
 
 pub fn play(self: Player, play_view: PlayView) !Play {
-    return self.vtable.play(self.ptr, play_view);
+    const ret = try self.vtable.play(self.ptr, play_view);
+    if (!isPlayLegal(play_view.hand, ret.card)) return error.IllegalPlay;
+    return ret;
+}
+
+fn isPlayLegal(hand: []const Card, card: Card) bool {
+    for (hand) |c| if (c.index() == card.index()) return true;
+    return false;
 }
 
 pub fn peg(self: *Player, n: u8) void {
