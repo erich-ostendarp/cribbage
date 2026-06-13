@@ -1,31 +1,53 @@
 const std = @import("std");
 
+const Match = struct {
+    num_matches: u8,
+    player_buf: [PlayerOpt.max_players]Player,
+    players: []Player,
+
+    const PlayerOpt = enum(u3) {
+        two = 2,
+        three,
+        four,
+
+        const len = std.enums.values(PlayerOpt).len;
+        const min_players = std.meta.fields(PlayerOpt)[0].value;
+        const max_players = std.meta.fields(PlayerOpt)[PlayerOpt.len - 1].value;
+    };
+
+    pub fn pinnedInit(self: *Match, num_matches: u8, players: [PlayerOpt.max_players]Player, player_opt: PlayerOpt) void {
+        self.* = .{
+            .num_matches = num_matches,
+            .player_buf = players,
+            .players = self.player_buf[0..@intFromEnum(player_opt)],
+        };
+    }
+};
+
 const Game = struct {
-    phase: Phase = .deal,
+    phase: enum { deal, draft, cut, play, show, game_over } = .deal,
     players: []Player,
 
     const winning_score = 121;
+    const win_points = 1;
 
-    fn running(self: *const Game) bool {
+    const hand_size = 4;
+
+    fn running(self: Game) bool {
         return self.phase != .game_over;
     }
 
     fn peg(self: *Game, player: *Player, n: u8) void {
-        player.peg(n);
+        player.score += n;
 
-        if (player.score() >= winning_score) {
+        if (player.score >= winning_score) {
+            player.matches += win_points;
+            for (self.players) |p| {
+                if (player.* == p) continue;
+            }
             self.phase = .game_over;
         }
     }
-};
-
-const Phase = union(enum) {
-    deal,
-    draft,
-    cut,
-    play,
-    show,
-    game_over,
 };
 
 const Draft = struct {};
@@ -37,6 +59,7 @@ const Player = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     score: u8 = 0,
+    matches: u8 = 0,
 
     const VTable = struct {
         draft: *const fn (*anyopaque, DraftView) anyerror!Draft,
@@ -101,9 +124,40 @@ const RandomPlayer = struct {
     }
 };
 
+const HumanPlayer = struct {
+    reader: *std.Io.Reader,
+
+    pub fn init(reader: *std.Io.Reader) HumanPlayer {
+        return .{ .reader = reader };
+    }
+
+    pub fn draft(self: *HumanPlayer, draft_view: DraftView) !Draft {
+        _ = self;
+        _ = draft_view;
+        return error.Unimplemented;
+    }
+
+    pub fn play(self: *HumanPlayer, play_view: PlayView) !Play {
+        _ = self;
+        _ = play_view;
+        return error.Unimplemented;
+    }
+
+    pub fn player(self: *HumanPlayer) Player {
+        return Player.init(self);
+    }
+};
+
 const Card = struct {
     rank: Rank,
     suit: Suit,
+
+    fn value(self: Card) u8 {
+        return switch (self.rank) {
+            .jack, .queen, .king => 10,
+            inline else => |r| @intFromEnum(r) + 1,
+        };
+    }
 };
 
 const Rank = enum {
@@ -137,31 +191,34 @@ pub fn main(init: std.process.Init) !void {
     var stdin_buf: [1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(init.io, &stdin_buf);
     const stdin = &stdin_reader.interface;
-    _ = stdin;
 
     const rng = (std.Random.IoSource{ .io = init.io }).interface();
-    _ = rng;
 
     var game = Game{ .players = &[_]Player{} };
     while (game.running()) {
-        switch (game.phase) {
-            .deal => |p| {
-                _ = p;
-            },
-            .draft => |p| {
-                _ = p;
-            },
-            .cut => |p| {
-                _ = p;
-            },
-            .play => |p| {
-                _ = p;
-            },
-            .show => |p| {
-                _ = p;
-            },
-            .game_over => unreachable,
-        }
+        // switch (game.phase) {
+        //     .deal => game.deal(rng),
+        //     .draft => game.draft(),
+        //     .cut => game.cut(),
+        //     .play => game.play(),
+        //     .show => game.show(),
+        //     .game_over => unreachable,
+        // }
         break;
     }
+
+    var players: [Match.PlayerOpt.max_players]Player = undefined;
+
+    var rands: [2]RandomPlayer = undefined;
+    for (&rands, players[0..rands.len]) |*rand, *player| {
+        rand.* = .init(rng);
+        player.* = rand.player();
+    }
+
+    var human = HumanPlayer.init(stdin);
+    players[rands.len] = human.player();
+
+    var match: Match = undefined;
+    match.pinnedInit(5, players, .three);
+    std.debug.print("{any}\n", .{match.players[0]});
 }
